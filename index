@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESCAPE 100 3D — P2P 무서버 멀티플레이</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+        body { background: #050508; color: #fff; font-family: sans-serif; overflow: hidden; width: 100vw; height: 100vh; }
+        #canvas-container { width: 100%; height: 100%; position: absolute; }
+        
+        /* 로비 및 방 생성 UI */
+        #lobby-overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(10, 15, 26, 0.95); z-index: 30;
+            display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 15px;
+        }
+        .lobby-card { background: #1e293b; padding: 25px; border-radius: 12px; border: 1px solid #3b82f6; width: 420px; text-align: center; }
+        .input-group { margin: 12px 0; text-align: left; }
+        .input-group label { display: block; font-size: 12px; color: #9ca3af; margin-bottom: 5px; }
+        textarea { width: 100%; height: 70px; background: #0f172a; border: 1px solid #4b5563; color: #34d399; font-size: 11px; padding: 8px; border-radius: 6px; resize: none; word-break: break-all; }
+        .btn { width: 100%; background: #2563eb; color: white; border: none; padding: 12px; font-weight: bold; border-radius: 6px; cursor: pointer; margin-top: 5px; }
+        .btn:hover { background: #1d4ed8; }
+        .btn-secondary { background: #10b981; }
+        .btn-secondary:hover { background: #059669; }
+
+        /* HUD & Radar */
+        #minimap-container { position: absolute; top: 20px; right: 20px; width: 150px; height: 150px; background: rgba(0,0,0,0.8); border: 2px solid #3b82f6; border-radius: 50%; overflow: hidden; z-index: 10; }
+        #hud { position: absolute; top: 20px; left: 20px; background: rgba(17,24,39,0.85); padding: 10px 16px; border-radius: 8px; border: 1px solid #4b5563; z-index: 5; font-size: 13px; }
+        #crosshair { position: absolute; top: 50%; left: 50%; width: 6px; height: 6px; transform: translate(-50%, -50%); background: #fff; border-radius: 50%; pointer-events: none; z-index: 5; }
+    </style>
+    <!-- Three.js 3D Engine -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+
+<div id="canvas-container"></div>
+<div id="crosshair"></div>
+
+<div id="minimap-container"><canvas id="minimapCanvas" width="150" height="150"></canvas></div>
+<div id="hud">
+    <div>역할: <span id="my-role" style="color:#60a5fa">대기 중</span></div>
+    <div>상태: <span id="conn-status" style="color:#faca15">방 미생성</span></div>
+</div>
+
+<!-- 로비 대기실 (P2P WebRTC 핸드셰이크) -->
+<div id="lobby-overlay">
+    <div class="lobby-card">
+        <h2 style="font-size: 20px; color: #60a5fa;">ESCAPE 100 P2P MULTIPLAYER</h2>
+        <p style="font-size: 12px; color: #9ca3af; margin-top: 4px;">서버 없이 친구와 1인칭 탈옥 대전을 시작합니다</p>
+        
+        <div style="display: flex; gap: 10px; margin-top: 15px;">
+            <button class="btn" onclick="createRoom()">방 만들기 (교도관)</button>
+            <button class="btn btn-secondary" onclick="showJoinUI()">방 입장하기 (탈옥수)</button>
+        </div>
+
+        <div id="host-panel" style="display:none;" class="input-group">
+            <label>1. 내 방 코드 (친구에게 전달):</label>
+            <textarea id="host-code" readonly></textarea>
+            <button class="btn" style="background:#4b5563;" onclick="copyCode('host-code')">방 코드 복사하기</button>
+
+            <label style="margin-top:10px;">2. 친구가 보낸 입장 응답 코드 붙여넣기:</label>
+            <textarea id="host-answer" placeholder="친구가 전달해준 응답 코드를 붙여넣으세요"></textarea>
+            <button class="btn btn-secondary" onclick="connectHost()">게임 시작하기</button>
+        </div>
+
+        <div id="client-panel" style="display:none;" class="input-group">
+            <label>1. 방장이 알려준 방 코드 붙여넣기:</label>
+            <textarea id="client-offer" placeholder="방장에게 받은 코드를 붙여넣으세요"></textarea>
+            <button class="btn" onclick="generateAnswer()">응답 코드 생성</button>
+
+            <label style="margin-top:10px;">2. 생성된 응답 코드를 방장에게 전달:</label>
+            <textarea id="client-answer" readonly></textarea>
+            <button class="btn btn-secondary" onclick="copyCode('client-answer')">응답 코드 복사하기</button>
+        </div>
+    </div>
+</div>
+
+<script>
+// --- WebRTC P2P 통신 연결 모듈 ---
+let peerConnection;
+let dataChannel;
+let isHost = false;
+let myRole = 'ESCAPIST';
+
+const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+function createRoom() {
+    isHost = true;
+    myRole = 'GUARD';
+    document.getElementById('my-role').innerText = '교도관 (방장)';
+    document.getElementById('host-panel').style.display = 'block';
+
+    peerConnection = new RTCPeerConnection(config);
+    dataChannel = peerConnection.createDataChannel("gameData");
+    setupDataChannel();
+
+    peerConnection.onicecandidate = e => {
+        if (!e.candidate) {
+            document.getElementById('host-code').value = JSON.stringify(peerConnection.localDescription);
+            document.getElementById('conn-status').innerText = '방 코드 생성 완료';
+        }
+    };
+
+    peerConnection.createOffer().then(offer => peerConnection.setLocalDescription(offer));
+}
+
+function showJoinUI() {
+    isHost = false;
+    myRole = 'ESCAPIST';
+    document.getElementById('my-role').innerText = '탈옥수 (참가자)';
+    document.getElementById('client-panel').style.display = 'block';
+}
+
+function generateAnswer() {
+    const offerStr = document.getElementById('client-offer').value;
+    if (!offerStr) return alert("방 코드를 입력해주세요.");
+
+    peerConnection = new RTCPeerConnection(config);
+    peerConnection.ondatachannel = e => {
+        dataChannel = e.channel;
+        setupDataChannel();
+    };
+
+    peerConnection.onicecandidate = e => {
+        if (!e.candidate) {
+            document.getElementById('client-answer').value = JSON.stringify(peerConnection.localDescription);
+        }
+    };
+
+    const offer = JSON.parse(offerStr);
+    peerConnection.setRemoteDescription(offer)
+        .then(() => peerConnection.createAnswer())
+        .then(answer => peerConnection.setLocalDescription(answer));
+}
+
+function connectHost() {
+    const answerStr = document.getElementById('host-answer').value;
+    if (!answerStr) return alert("응답 코드를 입력해주세요.");
+    const answer = JSON.parse(answerStr);
+    peerConnection.setRemoteDescription(answer);
+}
+
+function setupDataChannel() {
+    dataChannel.onopen = () => {
+        document.getElementById('conn-status').innerText = '연결 완료!';
+        document.getElementById('conn-status').style.color = '#34d399';
+        document.getElementById('lobby-overlay').style.display = 'none';
+        renderer.domElement.requestPointerLock();
+    };
+
+    dataChannel.onmessage = e => {
+        const data = JSON.parse(e.data);
+        if (data.type === 'move') {
+            updateRemotePlayer(data);
+        }
+    };
+}
+
+function copyCode(elementId) {
+    const text = document.getElementById(elementId);
+    text.select();
+    document.execCommand('copy');
+    alert('코드가 클립보드에 복사되었습니다. 친구에게 전달하세요!');
+}
+
+// --- Three.js 3D 멀티플레이어 그래픽 & 물리 엔진 ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x050508);
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+
+// 3D 바닥
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(48, 48), new THREE.MeshStandardMaterial({ color: 0x1f2937 }));
+floor.rotation.x = -Math.PI / 2;
+scene.add(floor);
+
+// 내 플레이어 및 상대방 3D 캐릭터 Mesh
+let player = { x: isHost ? 20 : 6, y: 1.6, z: isHost ? 20 : 6, rotY: 0, rotX: 0 };
+let remoteMesh;
+
+function createRemoteMesh(role) {
+    const isGuard = role === 'GUARD';
+    const geo = new THREE.CylinderGeometry(0.5, 0.5, 1.6);
+    const mat = new THREE.MeshStandardMaterial({ color: isGuard ? 0x1e3a8a : 0xeab308 });
+    const mesh = new THREE.Mesh(geo, mat);
+    scene.add(mesh);
+    return mesh;
+}
+
+function updateRemotePlayer(data) {
+    if (!remoteMesh) {
+        remoteMesh = createRemoteMesh(data.role);
+    }
+    remoteMesh.position.set(data.x, data.y - 0.8, data.z);
+    remoteMesh.rotation.y = data.rotY;
+}
+
+// 시점 조작
+document.addEventListener('mousemove', (e) => {
+    if (document.pointerLockElement !== renderer.domElement) return;
+    player.rotY -= e.movementX * 0.0025;
+    player.rotX -= e.movementY * 0.0025;
+});
+
+// P2P 실시간 좌표 전송 (60Hz)
+function sendPosition() {
+    if (dataChannel && dataChannel.readyState === 'open') {
+        dataChannel.send(JSON.stringify({
+            type: 'move',
+            role: myRole,
+            x: player.x,
+            y: player.y,
+            z: player.z,
+            rotY: player.rotY
+        }));
+    }
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    const euler = new THREE.Euler(0, 0, 0, 'YXZ');
+    euler.x = player.rotX;
+    euler.y = player.rotY;
+    camera.quaternion.setFromEuler(euler);
+    camera.position.set(player.x, player.y, player.z);
+
+    sendPosition();
+    renderer.render(scene);
+}
+
+animate();
+</script>
+</body>
+</html>
